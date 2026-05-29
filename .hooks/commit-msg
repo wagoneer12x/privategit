@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -eo pipefail
+if [[ "$(git config --local --get hooks.pseudoEncryptCommits 2>/dev/null || true)" != "true" ]]; then
+  exit 0
+fi
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
+TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+SHORT_HASH=$(git rev-parse --short HEAD 2>/dev/null || echo "initial")
+BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null || echo "detached")
+ORIGINAL_MSG=$(cat "$1" 2>/dev/null | tr '\n' ' ' | sed 's/  */ /g; s/^ *//; s/ *$//')
+ORIGINAL_MSG_ESC=$(printf '%s' "$ORIGINAL_MSG" | sed 's/\\/\\\\/g; s/"/\\"/g')
+FILES_CHANGED=$(git diff --cached --name-only 2>/dev/null | tr '\n' ',' | sed 's/,$//')
+echo "{\"ts\":\"${TIMESTAMP}\",\"branch\":\"${BRANCH}\",\"hash\":\"${SHORT_HASH}\",\"msg\":\"${ORIGINAL_MSG_ESC}\",\"files\":\"${FILES_CHANGED}\"}" >> "$ROOT/.commits.jsonl"
+echo ".." > "$1"
+echo "🪝 commit-msg: .. (logged to .commits.jsonl)"

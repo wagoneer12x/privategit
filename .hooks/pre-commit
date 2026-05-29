@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+set -eo pipefail
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
+[[ "$(git config core.hooksPath 2>/dev/null)" != ".hooks" ]] && git config --local include.path ../.gitconfig
+
+# -1: fail-fast layout gate
+if [[ -x "$ROOT/.scripts/verify-repo-layout.sh" ]]; then
+  "$ROOT/.scripts/verify-repo-layout.sh" || { echo "🪝 pre-commit: BLOCKED — verify-repo-layout.sh failed"; exit 1; }
+fi
+
+# 0: pack blob dirs only when source trees differ from .enc/blob-src.sha256.
+BLOB_DIRS_ANY=0
+if [[ -f "$ROOT/.scripts/blob-dirs.txt" ]]; then
+  while IFS= read -r dir || [[ -n "$dir" ]]; do
+    [[ -z "$dir" || "$dir" = \#* ]] && continue
+    dir="${dir%%#*}"; dir="${dir// /}"; [[ -z "$dir" ]] && continue
+    [[ -d "$ROOT/$dir" ]] && BLOB_DIRS_ANY=1 && break
+  done < "$ROOT/.scripts/blob-dirs.txt"
+fi
+
+if [[ "$BLOB_DIRS_ANY" -eq 1 ]] && bash "$ROOT/.scripts/blob-src-hash.sh" "$ROOT" needed; then
+  if [[ ! -x "$ROOT/.scripts/pack-secrets.sh" ]]; then
+    echo "🪝 pre-commit: BLOCKED — .scripts/pack-secrets.sh not executable"
+    exit 1
+  fi
+  if [[ -z "${BLOB_SECRET:-}" ]]; then
+    [[ -f "$ROOT/.scripts/load-secrets.sh" ]] && source "$ROOT/.scripts/load-secrets.sh" 2>/dev/null || true
+  fi
+  if [[ -z "${BLOB_SECRET:-}" ]]; then
+    echo "🪝 pre-commit: BLOCKED — blob encryption required but BLOB_SECRET not available."
+    echo "   .env.local, export, or Keychain (BLOB_SECRET, service=env.local)"
+    exit 1
+  fi
+  if ! GIT_HOOK=1 "$ROOT/.scripts/pack-secrets.sh"; then
+    echo "🪝 pre-commit: BLOCKED — pack-secrets.sh failed"
+    exit 1
+  fi
+  while IFS= read -r dir || [[ -n "$dir" ]]; do
+    [[ -z "$dir" || "$dir" = \#* ]] && continue
+    dir="${dir%%#*}"; dir="${dir// /}"; [[ -z "$dir" ]] && continue
+    [[ -f "$ROOT/.enc/${dir}.enc" ]] && git add "$ROOT/.enc/${dir}.enc" 2>/dev/null || true
+  done < "$ROOT/.scripts/blob-dirs.txt"
+  [[ -f "$ROOT/.enc/blob-src.sha256" ]] && git add "$ROOT/.enc/blob-src.sha256" 2>/dev/null || true
+  echo "🪝 pre-commit: blob packs staged"
+fi
+
+CLEARMETA="$ROOT/.hooks/scripts/clearmeta.sh"
+if [[ -x "$CLEARMETA" ]]; then
+  staged=$(git diff --cached --name-only --diff-filter=ACM 2>/dev/null)
+  if [[ -n "$staged" ]]; then
+    while IFS= read -r f; do
+      case "$f" in
+        .git/*|.hooks/*|.commits.jsonl|.gitattributes|.gitignore|.gitconfig) continue ;;
+      esac
+      [[ -f "$f" ]] && "$CLEARMETA" -q "$f" 2>/dev/null && git add "$f" 2>/dev/null || true
+    done <<< "$staged"
+    echo "🪝 pre-commit: metadata stripped"
+  fi
+fi
+exit 0

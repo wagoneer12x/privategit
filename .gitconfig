@@ -1,0 +1,11 @@
+[core]
+	hooksPath = .hooks
+	compression = 9
+[protocol]
+	version = 2
+[push]
+	negotiate = true
+[pack]
+	compression = 9
+[lfs]
+	concurrenttransfers = 8

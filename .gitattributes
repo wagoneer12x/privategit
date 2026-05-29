@@ -1,0 +1,11 @@
+# Template-safe defaults: keep bootstrap files plaintext.
+# After running git-crypt init in a derived repo, uncomment:
+# * filter=git-crypt diff=git-crypt
+.gitattributes -filter -diff
+.gitignore     -filter -diff
+.gitmodules    -filter -diff
+.gitconfig     -filter -diff
+.cursorignore  -filter -diff
+.hooks/**      -filter -diff
+.scripts/**    -filter -diff
+scripts/**     -filter -diff

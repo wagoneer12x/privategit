@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+set -eo pipefail
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
+[[ "$(git config core.hooksPath 2>/dev/null)" != ".hooks" ]] && git config --local include.path ../.gitconfig
+R2_CFG="$ROOT/config/r2.config.json"
+
+if command -v shelllock >/dev/null 2>&1 && [[ "${SHELLLOCK_VERIFIED:-}" != "1" ]]; then
+  shelllock -m "Push to remote?" true || { echo "🪝 pre-push: BLOCKED — Touch ID denied"; exit 1; }
+fi
+
+# Blob gates (fail-closed): require secret, require R2 LFS wiring, and require ciphertext fingerprint.
+BLOB_DIRS_ANY=0
+if [[ -f "$ROOT/.scripts/blob-dirs.txt" ]]; then
+  while IFS= read -r dir || [[ -n "$dir" ]]; do
+    [[ -z "$dir" || "$dir" = \#* ]] && continue
+    dir="${dir%%#*}"; dir="${dir// /}"; [[ -z "$dir" ]] && continue
+    [[ -d "$ROOT/$dir" ]] && BLOB_DIRS_ANY=1 && break
+  done < "$ROOT/.scripts/blob-dirs.txt"
+fi
+if [[ "$BLOB_DIRS_ANY" -eq 1 ]]; then
+  [[ -f "$ROOT/.scripts/load-secrets.sh" ]] && source "$ROOT/.scripts/load-secrets.sh" 2>/dev/null || true
+  if [[ ! -x "$ROOT/.scripts/verify-blob-secret.sh" ]]; then
+    echo "🪝 pre-push: BLOCKED — .scripts/verify-blob-secret.sh not executable"
+    exit 1
+  fi
+  if ! "$ROOT/.scripts/verify-blob-secret.sh"; then
+    echo "🪝 pre-push: BLOCKED — BLOB_SECRET missing; cannot push."
+    echo "   .env.local, export, or Keychain (BLOB_SECRET, service=env.local)"
+    exit 1
+  fi
+  echo "🪝 pre-push: blob passphrase verified"
+
+  command -v aws >/dev/null 2>&1 || { echo "🪝 pre-push: BLOCKED — aws CLI not found (required for R2 transfer)"; exit 1; }
+  command -v jq  >/dev/null 2>&1 || { echo "🪝 pre-push: BLOCKED — jq not found (required for R2 transfer)"; exit 1; }
+  [[ -n "${AWS_ACCESS_KEY_ID:-}" && -n "${AWS_SECRET_ACCESS_KEY:-}" ]] || {
+    echo "🪝 pre-push: BLOCKED — missing AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY for R2 transfer"
+    echo "   Set .env.local, export env, or Keychain (R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY, service=env.local)"
+    exit 1
+  }
+  cfg_endpoint=""
+  cfg_bucket=""
+  if [[ -f "$R2_CFG" ]]; then
+    cfg_endpoint="$(jq -r '.r2.endpoint // empty' "$R2_CFG" 2>/dev/null || true)"
+    cfg_bucket="$(jq -r '.r2.bucket // empty' "$R2_CFG" 2>/dev/null || true)"
+  fi
+  eff_endpoint="${R2_ENDPOINT:-$cfg_endpoint}"
+  eff_bucket="${R2_BUCKET:-$cfg_bucket}"
+  [[ -n "$eff_endpoint" && -n "$eff_bucket" ]] || {
+    echo "🪝 pre-push: BLOCKED — missing R2 endpoint/bucket (set R2_ENDPOINT/R2_BUCKET or config/r2.config.json)"
+    exit 1
+  }
+
+  LFS_AGENT="$(git config --local --get lfs.standalonetransferagent 2>/dev/null || true)"
+  LFS_PATH="$(git config --local --get lfs.customtransfer.r2.path 2>/dev/null || true)"
+  if [[ "$LFS_AGENT" != "r2" ]]; then
+    echo "🪝 pre-push: BLOCKED — lfs.standalonetransferagent must be 'r2' (got: '${LFS_AGENT:-<unset>}')"
+    exit 1
+  fi
+  case "$LFS_PATH" in
+    */scripts/lfs-r2-transfer.sh) ;;
+    *)
+      echo "🪝 pre-push: BLOCKED — lfs.customtransfer.r2.path must end with scripts/lfs-r2-transfer.sh (got: '${LFS_PATH:-<unset>}')"
+      exit 1
+      ;;
+  esac
+  [[ -x "$LFS_PATH" ]] || { echo "🪝 pre-push: BLOCKED — LFS transfer script not executable: '$LFS_PATH'"; exit 1; }
+
+  command -v python3 >/dev/null 2>&1 || { echo "🪝 pre-push: BLOCKED — python3 not found"; exit 1; }
+  while IFS= read -r dir || [[ -n "$dir" ]]; do
+    [[ -z "$dir" || "$dir" == \#* ]] && continue
+    dir="${dir%%#*}"; dir="${dir// /}"; [[ -z "$dir" ]] && continue
+    blob="$ROOT/.enc/${dir}.enc"
+    [[ -f "$blob" ]] || continue
+    ok="$(python3 -c 'import sys; b=open(sys.argv[1],"rb").read(8); sys.stdout.write("1" if b==b"Salted__" else "0")' "$blob" 2>/dev/null || echo 0)"
+    if [[ "$ok" != "1" ]]; then
+      echo "🪝 pre-push: BLOCKED — ciphertext fingerprint mismatch (missing 'Salted__'): $blob"
+      exit 1
+    fi
+  done < "$ROOT/.scripts/blob-dirs.txt"
+fi
+
+HEALTH="$ROOT/.hooks/scripts/health-check.sh"
+if [[ -x "$HEALTH" ]]; then
+  echo "🪝 pre-push: health check"
+  "$HEALTH" || exit $?
+fi
+
+if git config --local --get filter.git-crypt.required >/dev/null 2>&1 && command -v git-crypt >/dev/null 2>&1; then
+  GC_OUT="$(git-crypt status -f 2>&1 || true)"
+  if [[ "$GC_OUT" == *"still unencrypted"* || "$GC_OUT" == *"WARNING"* ]]; then
+    echo "🪝 pre-push: BLOCKED — git-crypt warnings detected"
+    echo "$GC_OUT" >&2
+    exit 1
+  fi
+fi
+
+if command -v git-lfs >/dev/null 2>&1; then
+  git lfs pre-push "$@" || exit $?
+fi
